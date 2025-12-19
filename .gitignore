@@ -1,0 +1,32 @@
+# Backup directories
+docker-backups/
+*.tar.gz
+
+# Temporary files
+/tmp/
+*.tmp
+*.log
+pull-output.txt
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Environment files (may contain secrets)
+.env
+*.env.local
+
+# Test files
+test-*.sh
+scratch/
+
+# Local configuration
+local-config.sh
+
