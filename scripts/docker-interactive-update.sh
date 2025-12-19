@@ -53,6 +53,85 @@ get_service_info() {
     echo "$image"
 }
 
+# Function to check disk space
+check_disk_space() {
+    local backup_base_dir=$1
+    local service_name=$2
+    
+    # Get available space in GB
+    local available_gb=$(df -BG "${backup_base_dir}" 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/G//')
+    
+    if [ -z "$available_gb" ]; then
+        # Fallback if backup dir doesn't exist yet
+        available_gb=$(df -BG /home 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/G//')
+    fi
+    
+    # Estimate backup size needed (rough estimate)
+    local container_name=$(grep -A 5 "^  ${service_name}:" "${COMPOSE_DIR}/docker-compose.yml" | grep "container_name:" | head -1 | awk '{print $2}' | tr -d '"')
+    if [ -z "$container_name" ]; then
+        container_name="${service_name}"
+    fi
+    
+    # Get container size if it exists
+    local estimated_size_mb=100  # Default 100MB minimum
+    if docker ps -a --format "{{.Names}}" | grep -q "^${container_name}$"; then
+        local container_size=$(docker ps -a --size --format "{{.Names}} {{.Size}}" | grep "^${container_name} " | awk '{print $(NF-1)}' | sed 's/MB//;s/GB/*1024/;s/KB/\/1024/' | bc 2>/dev/null || echo "100")
+        estimated_size_mb=$((${container_size%.*} + 100))  # Add 100MB buffer
+    fi
+    
+    local estimated_size_gb=$((estimated_size_mb / 1024 + 1))
+    
+    echo -e "${CYAN}Disk Space Check:${NC}"
+    echo -e "  Available: ${GREEN}${available_gb}GB${NC}"
+    echo -e "  Estimated backup size: ${BLUE}~${estimated_size_gb}GB${NC}"
+    
+    # Warn if low on space (less than 5GB or less than needed + 2GB buffer)
+    local min_required=$((estimated_size_gb + 2))
+    if [ "$available_gb" -lt 5 ]; then
+        echo -e "  ${RED}⚠ WARNING: Low disk space!${NC}"
+        return 1
+    elif [ "$available_gb" -lt "$min_required" ]; then
+        echo -e "  ${YELLOW}⚠ Space is tight, but should be sufficient${NC}"
+    else
+        echo -e "  ${GREEN}✓ Sufficient space available${NC}"
+    fi
+    
+    echo ""
+    return 0
+}
+
+# Function to show existing backups
+show_existing_backups() {
+    local service_name=$1
+    local backup_base_dir=$2
+    
+    # Find existing backups for this service
+    local existing_backups=$(find "${backup_base_dir}" -maxdepth 1 -type d -name "*${service_name}" 2>/dev/null | sort -r)
+    
+    if [ -n "$existing_backups" ]; then
+        echo -e "${CYAN}Existing backups for ${service_name}:${NC}"
+        local count=0
+        while IFS= read -r backup; do
+            if [ -n "$backup" ]; then
+                local backup_name=$(basename "$backup")
+                local backup_date=$(echo "$backup_name" | grep -oP '\d{8}_\d{6}' || echo "unknown")
+                local backup_size=$(du -sh "$backup" 2>/dev/null | awk '{print $1}')
+                local backup_age=$(find "$backup" -maxdepth 0 -printf '%Ar\n' 2>/dev/null || echo "unknown")
+                
+                ((count++))
+                echo -e "  ${count}) ${backup_name}"
+                echo -e "     Size: ${backup_size} | Age: ${backup_age}"
+            fi
+        done <<< "$existing_backups"
+        
+        echo -e "${YELLOW}  Note: New backup will be created. Old backups are kept for safety.${NC}"
+        echo ""
+    else
+        echo -e "${BLUE}No existing backups found for ${service_name}${NC}"
+        echo ""
+    fi
+}
+
 # Function to backup service
 backup_service() {
     local service_name=$1
@@ -65,6 +144,18 @@ backup_service() {
     echo -e "  • Volume data (your actual data)"
     echo -e "  • Current image (so we can rollback if needed)"
     echo ""
+    
+    # Check disk space
+    if ! check_disk_space "${BACKUP_BASE_DIR}" "${service_name}"; then
+        echo -e "${RED}Insufficient disk space for backup!${NC}"
+        read -p "$(echo -e ${YELLOW}Continue anyway? [y/N]:${NC} )" -r proceed
+        if [[ ! $proceed =~ ^[Yy]$ ]]; then
+            return 1
+        fi
+    fi
+    
+    # Show existing backups
+    show_existing_backups "${service_name}" "${BACKUP_BASE_DIR}"
     
     mkdir -p "${backup_dir}/config"
     mkdir -p "${backup_dir}/volumes"
@@ -422,6 +513,51 @@ update_service() {
     pause
 }
 
+# Function to clean old backups
+cleanup_old_backups() {
+    local backup_base_dir=$1
+    local days_to_keep=${2:-7}  # Default 7 days
+    
+    echo ""
+    echo -e "${CYAN}Checking for old backups (older than ${days_to_keep} days)...${NC}"
+    
+    local old_backups=$(find "${backup_base_dir}" -maxdepth 1 -type d -mtime +${days_to_keep} -name "interactive-*" 2>/dev/null)
+    
+    if [ -n "$old_backups" ]; then
+        local count=$(echo "$old_backups" | wc -l)
+        local total_size=$(du -sh $(echo "$old_backups") 2>/dev/null | awk '{sum+=$1} END {print sum}')
+        
+        echo -e "${YELLOW}Found ${count} old backup(s) using ~${total_size}${NC}"
+        echo ""
+        echo "$old_backups" | while read -r backup; do
+            if [ -n "$backup" ]; then
+                local backup_name=$(basename "$backup")
+                local backup_size=$(du -sh "$backup" 2>/dev/null | awk '{print $1}')
+                echo -e "  - ${backup_name} (${backup_size})"
+            fi
+        done
+        
+        echo ""
+        read -p "$(echo -e ${YELLOW}Delete these old backups to free space? [y/N]:${NC} )" -r cleanup
+        
+        if [[ $cleanup =~ ^[Yy]$ ]]; then
+            echo "$old_backups" | while read -r backup; do
+                if [ -n "$backup" ]; then
+                    rm -rf "$backup"
+                    echo -e "${GREEN}✓${NC} Deleted $(basename "$backup")"
+                fi
+            done
+            echo -e "${GREEN}Old backups cleaned up!${NC}"
+        else
+            echo -e "${BLUE}Keeping old backups${NC}"
+        fi
+    else
+        echo -e "${GREEN}No old backups to clean${NC}"
+    fi
+    
+    echo ""
+}
+
 # Main function
 main() {
     clear
@@ -441,6 +577,27 @@ EOF
     echo ""
     echo -e "${BLUE}This script will guide you through updating Docker containers${NC}"
     echo -e "${BLUE}one at a time, with explanations at each step.${NC}"
+    echo ""
+    
+    # Show disk space and backup info
+    echo -e "${CYAN}System Status:${NC}"
+    local available_space=$(df -h "${BACKUP_BASE_DIR}" 2>/dev/null | awk 'NR==2 {print $4}' || df -h /home | awk 'NR==2 {print $4}')
+    echo -e "  Available disk space: ${GREEN}${available_space}${NC}"
+    
+    if [ -d "${BACKUP_BASE_DIR}" ]; then
+        local total_backups=$(find "${BACKUP_BASE_DIR}" -maxdepth 1 -type d -name "interactive-*" 2>/dev/null | wc -l)
+        local backup_size=$(du -sh "${BACKUP_BASE_DIR}" 2>/dev/null | awk '{print $1}' || echo "0")
+        echo -e "  Total backups: ${BLUE}${total_backups}${NC}"
+        echo -e "  Backup storage used: ${BLUE}${backup_size}${NC}"
+        echo -e "  Backup location: ${CYAN}${BACKUP_BASE_DIR}${NC}"
+        
+        # Offer cleanup if many backups exist
+        if [ "$total_backups" -gt 10 ]; then
+            echo -e "  ${YELLOW}⚠ You have ${total_backups} backups. Consider cleanup after session.${NC}"
+        fi
+    else
+        echo -e "  ${BLUE}No backups yet${NC}"
+    fi
     echo ""
     
     pause
@@ -493,6 +650,9 @@ EOF
             echo -e "${GREEN}All done! Goodbye!${NC}"
             echo ""
             exit 0
+        elif [[ "$choice" == "c" ]] || [[ "$choice" == "C" ]]; then
+            cleanup_old_backups "${BACKUP_BASE_DIR}" 7
+            continue
         fi
         
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#service_array[@]}" ]; then
@@ -524,12 +684,30 @@ EOF
                     echo -e "  ${YELLOW}$((i+1)))${NC} ${svc} ${YELLOW}(not running)${NC}"
                 fi
             done
+            echo -e "  ${YELLOW}c)${NC} Clean old backups"
             echo -e "  ${RED}0)${NC} Exit"
             
         else
             echo -e "${RED}Invalid selection${NC}"
         fi
     done
+    
+    # Offer final cleanup
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}Session Complete!${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════${NC}"
+    
+    if [ -d "${BACKUP_BASE_DIR}" ]; then
+        local total_backups=$(find "${BACKUP_BASE_DIR}" -maxdepth 1 -type d -name "interactive-*" 2>/dev/null | wc -l)
+        if [ "$total_backups" -gt 5 ]; then
+            echo ""
+            read -p "$(echo -e ${YELLOW}Clean up old backups before exiting? [y/N]:${NC} )" -r final_cleanup
+            if [[ $final_cleanup =~ ^[Yy]$ ]]; then
+                cleanup_old_backups "${BACKUP_BASE_DIR}" 7
+            fi
+        fi
+    fi
 }
 
 # Run main
